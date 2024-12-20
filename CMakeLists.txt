@@ -14,17 +14,17 @@ endmacro(use_cxx11)
 
 find_package(OpenCV REQUIRED)                              
 
-set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -Wall -fexceptions")
+set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -Wall -fexceptions -fopenmp")
 
-set(SOURCES src/main.cpp src/postprocess.cpp src/rk_common.cpp)
+set(SOURCES src/main.cpp src/postprocess.cpp src/rk_common.cpp src/sahi.cpp)
 
-set(EXTRA_LIBS ${OpenCV_LIBS} /usr/local/lib/librknnrt.so)
+set(EXTRA_LIBS ${OpenCV_LIBS} /usr/lib/librknnrt.so)
 
 set(EXECUTABLE_OUTPUT_PATH "../")
 
 include_directories(include ${OpenCV_INCLUDE_DIRS})
 
-add_link_options(-fopenmp -s -ldl -lpthread -pthread -lgomp -rdynamic -march=armv8.2-a)
+add_link_options(-fopenmp -s -ldl -lpthread -pthread -lgomp -rdynamic -march=native)
 
 add_executable(YoloV8_NPU ${SOURCES})
 
