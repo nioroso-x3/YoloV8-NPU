@@ -85,8 +85,13 @@ int main(int argc, char** argv)
 
         rknn_context          ctx;
         rknn_input_output_num io_num;
-
-        ret = rknn_init(&ctx, model_data, model_data_size, 0, NULL);
+        if(i == 0){
+            ret = rknn_init(&ctx, model_data, model_data_size, 0, NULL);
+            free(model_data);
+        }
+        else{
+            ret = rknn_dup_context(&rknn_app_ctx[0].rknn_ctx,&ctx);
+        }
 
         if(ret < 0){
             printf("rknn_init fail! ret=%d %d\n", ret,i);
@@ -170,7 +175,6 @@ int main(int argc, char** argv)
             return ret;
         }
     }
-    free(model_data);
     //set the core affinity for each context
     //rknn_core_mask masks[] = {RKNN_NPU_CORE_0,RKNN_NPU_CORE_0,RKNN_NPU_CORE_1,RKNN_NPU_CORE_1,RKNN_NPU_CORE_2,RKNN_NPU_CORE_2};
     for (int i = 0; i < N; ++i){
@@ -189,16 +193,15 @@ int main(int argc, char** argv)
     int height  = rknn_app_ctx[0].model_height;
 
     std::string device = imagepath;
-    /*
+    
     std::string pipeline = "shmsrc is-live=true do-timestamp=true socket-path=" + device + " ! "
-                           "video/x-raw, format=(string)RGB, width=(int)2592, height=(int)1944, framerate=(fraction)50/1, "
+                           "video/x-raw, format=(string)RGB, width=(int)1600, height=(int)1200, framerate=(fraction)50/1, "
                            "interlace-mode=(string)progressive, multiview-mode=(string)mono, "
                            "multiview-flags=(GstVideoMultiviewFlagsSet)0:ffffffff:/right-view-first/left-flipped/left-flopped/right-flipped/right-flopped/half-aspect/mixed-mono, "
                            "pixel-aspect-ratio=(fraction)1/1, colorimetry=(string)2:1:5:1 ! "
-                           "queue ! videorate ! videoconvert ! video/x-raw,framerate=5/1 ! appsink max-buffers=3 drop=true";
-    */
+                           "queue ! videorate ! videoconvert ! video/x-raw,framerate=25/1 ! appsink max-buffers=2 drop=true";
+   
     std::string out_pipeline = "appsrc ! queue ! mpph265enc bps=10000000 gop=20 header-mode=1 width=1024 height=768 ! h265parse config-interval=-1 ! rtph265pay ! multiudpsink clients=192.168.1.10:6600";
-    std::string pipeline = "videotestsrc ! videoconvert ! appsink"; 
     cv::VideoCapture cap(pipeline,cv::CAP_GSTREAMER);
     cv::VideoWriter out(out_pipeline, cv::CAP_GSTREAMER, 0, 10, cv::Size (2592, 1944), true);
     
@@ -215,11 +218,11 @@ int main(int argc, char** argv)
     }
 
     std::vector<cv::Rect> slices;
-
+    uint64_t framecount = 0;
+    //orig_img = cv::imread("./image_test.png");
     while(run){
         //load image or frame
-        //cap >> orig_img;
-        orig_img = cv::imread("./image.png");
+        cap >> orig_img;
         if(orig_img.empty()) {
             printf("Error grabbing\n");
             break;
@@ -227,7 +230,7 @@ int main(int argc, char** argv)
 
         Tbegin = std::chrono::steady_clock::now();
         if (slices.size() == 0){
-            slices = getSliceBBoxes(orig_img.rows,orig_img.cols,height,width,true,0.2f,0.2f);
+            slices = getSliceBBoxes(orig_img.rows,orig_img.cols,height,width,true,0.25f,0.25f);
             slices.push_back(cv::Rect(cv::Point(0,0),cv::Size(orig_img.cols,orig_img.rows)));
             printf("Num slices: %d\n",slices.size());
             for (int i = 0; i < slices.size(); ++i){
@@ -290,30 +293,48 @@ int main(int argc, char** argv)
             results[s] = od_results;
             ret = rknn_outputs_release(rknn_app_ctx[tid].rknn_ctx, rknn_app_ctx[tid].io_num.n_output, outputs);
         }
-        //display results
-        for(int s = 0; s < slices.size(); ++s){
+        //process detected objects from slices
+         
+        std::vector<object_detect_result> all_results;
+        for(int s = 0; s < slices.size() ; ++s){
             for(int r = 0; r < results[s].count; ++r){
-                object_detect_result* det_result = &(results[s].results[r]);
-                printf("S %d R %d: %d %d %d %d %d %f\n",s,
-                                                        r,
-                                                        det_result->box.left,
-                                                        det_result->box.top,
-                                                        det_result->box.right,
-                                                        det_result->box.bottom,
-                                                        det_result->cls_id,
-                                                        det_result->prop);
-
+                if (s < (slices.size() - 1)){
+                    all_results.push_back(results[s].results[r]);
+                }
+            }
+        }
+        
+        //merge results from slices
+        std::vector<object_detect_result> merged_slices = greedy_nmm_postprocess(all_results, 0.2f, "IOU",true);
+        //add results of the full picture to the merged results
+        for(int r = 0; r < results.back().count; ++r){
+            merged_slices.push_back(results.back().results[r]);
+        }
+        //combine merged slices with full picture results
+        std::vector<object_detect_result> full_merge = greedy_nmm_postprocess(merged_slices, 0.2f, "IOU",true);
+        for (auto &det_result : full_merge){
+            float p = det_result.prop;
+            float cls_id = det_result.cls_id;
+            
+            if (p > 0.5 && ((cls_id >= 0) && (cls_id <= 8))){
+            printf("M: %d %d %d %d %d %d %f\n", framecount,
+                                             det_result.box.left,
+                                             det_result.box.top,
+                                             det_result.box.right,
+                                             det_result.box.bottom,
+                                             det_result.cls_id,
+                                             det_result.prop);
             }
         }
 
         //show output
-        //std::cout << "FPS" << f/16 << std::endl;
+        if (framecount % 30 == 0) std::cout << "FPS" << f/16 << std::endl;
         Tend = std::chrono::steady_clock::now();
         //calculate frame rate
         f = std::chrono::duration_cast <std::chrono::milliseconds> (Tend - Tbegin).count();
         if(f>0.0) FPS[((Fcnt++)&0x0F)]=1000.0/f;
         for(f=0.0, i=0;i<16;i++){ f+=FPS[i]; }
-        run = false;
+        framecount++;
     }
     for(int i = 0; i < N; ++i){
         if(rknn_app_ctx[i].input_attrs  != NULL) free(rknn_app_ctx[i].input_attrs);

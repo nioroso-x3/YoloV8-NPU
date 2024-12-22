@@ -222,3 +222,141 @@ std::map<int, std::vector<int>> batched_greedy_nmm(
     return keep_to_merge_list;
 }
 
+
+// Helper function to compute Intersection over Union (IoU)
+float compute_iou(const image_rect_t& box1, const image_rect_t& box2) {
+    int x_left = std::max(box1.left, box2.left);
+    int y_top = std::max(box1.top, box2.top);
+    int x_right = std::min(box1.right, box2.right);
+    int y_bottom = std::min(box1.bottom, box2.bottom);
+
+    int width = std::max(0, x_right - x_left);
+    int height = std::max(0, y_bottom - y_top);
+
+    float intersection = width * height;
+    float area1 = (box1.right - box1.left) * (box1.bottom - box1.top);
+    float area2 = (box2.right - box2.left) * (box2.bottom - box2.top);
+
+    float union_area = area1 + area2 - intersection;
+
+    if (union_area == 0.0f)
+        return 0.0f;
+    else
+        return intersection / union_area;
+}
+
+// Helper function to compute Intersection over Smaller Area (IoS)
+float compute_ios(const image_rect_t& box1, const image_rect_t& box2) {
+    int x_left = std::max(box1.left, box2.left);
+    int y_top = std::max(box1.top, box2.top);
+    int x_right = std::min(box1.right, box2.right);
+    int y_bottom = std::min(box1.bottom, box2.bottom);
+
+    int width = std::max(0, x_right - x_left);
+    int height = std::max(0, y_bottom - y_top);
+
+    float intersection = width * height;
+    float area1 = (box1.right - box1.left) * (box1.bottom - box1.top);
+    float area2 = (box2.right - box2.left) * (box2.bottom - box2.top);
+
+    float smaller_area = std::min(area1, area2);
+
+    if (smaller_area == 0.0f)
+        return 0.0f;
+    else
+        return intersection / smaller_area;
+}
+
+// Function to check if two predictions match based on the given metric and threshold
+bool has_match(
+    const object_detect_result& pred1,
+    const object_detect_result& pred2,
+    const std::string& match_metric,
+    float match_threshold)
+{
+    float match_value;
+    if (match_metric == "IOU")
+        match_value = compute_iou(pred1.box, pred2.box);
+    else if (match_metric == "IOS")
+        match_value = compute_ios(pred1.box, pred2.box);
+    else
+        throw std::invalid_argument("Invalid match_metric");
+
+    return match_value >= match_threshold;
+}
+
+// Function to merge two object predictions
+object_detect_result merge_object_prediction_pair(
+    const object_detect_result& pred1,
+    const object_detect_result& pred2)
+{
+    object_detect_result merged_pred;
+
+    // Merge the boxes by averaging coordinates
+    merged_pred.box.left = (pred1.box.left + pred2.box.left) / 2;
+    merged_pred.box.top = (pred1.box.top + pred2.box.top) / 2;
+    merged_pred.box.right = (pred1.box.right + pred2.box.right) / 2;
+    merged_pred.box.bottom = (pred1.box.bottom + pred2.box.bottom) / 2;
+
+    // Merge scores by averaging
+    merged_pred.prop = (pred1.prop + pred2.prop) / 2.0f;
+
+    // Assuming the class IDs are the same; otherwise, additional logic may be needed
+    merged_pred.cls_id = pred1.prop > pred2.prop ? pred1.cls_id : pred2.cls_id;
+
+    return merged_pred;
+}
+
+// The main function that combines everything
+std::vector<object_detect_result> greedy_nmm_postprocess(
+    const std::vector<object_detect_result>& object_predictions,
+    float match_threshold = 0.5f,
+    const std::string& match_metric = "IOU",
+    bool class_agnostic = true
+)
+{
+    // Make a copy of object predictions to modify
+    std::vector<object_detect_result> object_prediction_list = object_predictions;
+
+    std::map<int, std::vector<int>> keep_to_merge_list;
+
+    if (class_agnostic) {
+        keep_to_merge_list = greedy_nmm(
+            object_prediction_list,
+            match_metric,
+            match_threshold
+        );
+    } else {
+        keep_to_merge_list = batched_greedy_nmm(
+            object_prediction_list,
+            match_metric,
+            match_threshold
+        );
+    }
+
+    std::vector<object_detect_result> selected_object_predictions;
+
+    for (const auto& pair : keep_to_merge_list) {
+        int keep_ind = pair.first;
+        const std::vector<int>& merge_ind_list = pair.second;
+
+        for (int merge_ind : merge_ind_list) {
+            if (has_match(
+                object_prediction_list[keep_ind],
+                object_prediction_list[merge_ind],
+                match_metric,
+                match_threshold)) {
+
+                object_prediction_list[keep_ind] = merge_object_prediction_pair(
+                    object_prediction_list[keep_ind],
+                    object_prediction_list[merge_ind]
+                );
+            }
+        }
+        selected_object_predictions.push_back(object_prediction_list[keep_ind]);
+    }
+
+    return selected_object_predictions;
+}
+
+
