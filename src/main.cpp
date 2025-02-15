@@ -51,6 +51,29 @@ static const char* labels[] = {
 /*-------------------------------------------
                   Main Functions
 -------------------------------------------*/
+
+void draw_box(object_detect_result* det_result, cv::Mat orig_img){
+    int x1 = det_result->box.left;
+    int y1 = det_result->box.top;
+    int x2 = det_result->box.right;
+    int y2 = det_result->box.bottom;
+    char text[256];
+    cv::rectangle(orig_img, cv::Point(x1, y1), cv::Point(x2, y2),cv::Scalar(255, 0, 0));
+    sprintf(text, "%s %.1f%%", labels[det_result->cls_id], det_result->prop * 100);
+    
+    int baseLine = 0;
+    cv::Size label_size = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseLine);
+    
+    int x = det_result->box.left;
+    int y = det_result->box.top - label_size.height - baseLine;
+    if (y < 0) y = 0;
+    if (x + label_size.width > orig_img.cols) x = orig_img.cols - label_size.width;
+ 
+    cv::rectangle(orig_img, cv::Rect(cv::Point(x, y), cv::Size(label_size.width, label_size.height + baseLine)), cv::Scalar(255, 255, 255), -1);
+
+    cv::putText(orig_img, text, cv::Point(x, y + label_size.height), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0));
+}
+
 int main(int argc, char** argv)
 {
     float f;
@@ -63,13 +86,14 @@ int main(int argc, char** argv)
     int            N = 6;
     for(i=0;i<16;i++) FPS[i]=0.0;
 
-    if (argc < 3) {
-        fprintf(stderr,"Usage: %s [model] [imagepath]\n", argv[0]);
+    if (argc < 4) {
+        fprintf(stderr,"Usage: %s [model] [gstreamer input pipeline] [gstreamer output pipeline]\n", argv[0]);
         return -1;
     }
 
     char*          model_path = argv[1];
-    const char*    imagepath = argv[2];
+    const char*    pipeline = argv[2];
+    const char*    outpipeline = argv[3];
 
     printf("model: %s\n", model_path);
     printf("post process config: box_conf_threshold = %.2f, nms_threshold = %.2f\n", box_conf_threshold, nms_threshold);
@@ -192,19 +216,10 @@ int main(int argc, char** argv)
     int width   = rknn_app_ctx[0].model_width;
     int height  = rknn_app_ctx[0].model_height;
 
-    std::string device = imagepath;
+
     
-    std::string pipeline = "shmsrc is-live=true do-timestamp=true socket-path=" + device + " ! "
-                           "video/x-raw, format=(string)RGB, width=(int)1600, height=(int)1200, framerate=(fraction)50/1, "
-                           "interlace-mode=(string)progressive, multiview-mode=(string)mono, "
-                           "multiview-flags=(GstVideoMultiviewFlagsSet)0:ffffffff:/right-view-first/left-flipped/left-flopped/right-flipped/right-flopped/half-aspect/mixed-mono, "
-                           "pixel-aspect-ratio=(fraction)1/1, colorimetry=(string)2:1:5:1 ! "
-                           "queue ! videorate ! videoconvert ! video/x-raw,framerate=25/1 ! appsink max-buffers=2 drop=true";
-   
-    std::string out_pipeline = "appsrc ! queue ! mpph265enc bps=10000000 gop=20 header-mode=1 width=1024 height=768 ! h265parse config-interval=-1 ! rtph265pay ! multiudpsink clients=192.168.1.10:6600";
     cv::VideoCapture cap(pipeline,cv::CAP_GSTREAMER);
-    cv::VideoWriter out(out_pipeline, cv::CAP_GSTREAMER, 0, 10, cv::Size (2592, 1944), true);
-    
+    cv::VideoWriter out;
     std::vector<object_detect_result_list> results;
     
     bool run = true;
@@ -212,35 +227,51 @@ int main(int argc, char** argv)
         printf("Failed to open capture\n");
         run = false;
     }
-    if (!out.isOpened()) {
-        printf("Failed to open output\n");
-        run = false;
-    }
-
+   
     std::vector<cv::Rect> slices;
     uint64_t framecount = 0;
-    //orig_img = cv::imread("./image_test.png");
+
+    int ori_r = 0;
+    int ori_c = 0;
     while(run){
         //load image or frame
         cap >> orig_img;
+        ori_r = orig_img.rows;
+        ori_c = orig_img.cols;
         if(orig_img.empty()) {
             printf("Error grabbing\n");
             break;
         }
-
+        if (!out.isOpened()){
+            out.open(outpipeline, cv::CAP_GSTREAMER, 0, 60, cv::Size(ori_c,ori_r));
+            if (!out.isOpened()){
+              printf("Error creating output pipeline\n");
+              break;
+          }
+        }
         Tbegin = std::chrono::steady_clock::now();
+        if ((orig_img.cols != orig_img.rows)){
+            int s = orig_img.cols > orig_img.rows ? orig_img.cols : orig_img.rows;
+            cv::Mat one2one(cv::Size(s,s),CV_8UC3,cv::Scalar(0,0,0));
+            orig_img.copyTo(one2one(cv::Rect(0,0,orig_img.cols,orig_img.rows)));
+            orig_img = one2one.clone();
+        }
         if (slices.size() == 0){
-            slices = getSliceBBoxes(orig_img.rows,orig_img.cols,height,width,true,0.25f,0.25f);
-            slices.push_back(cv::Rect(cv::Point(0,0),cv::Size(orig_img.cols,orig_img.rows)));
+            slices = getSliceBBoxes(ori_r,ori_c,height,width,true,0.25f,0.25f);
+            slices.push_back(cv::Rect(0,0,orig_img.rows,orig_img.cols));
             printf("Num slices: %d\n",slices.size());
             for (int i = 0; i < slices.size(); ++i){
                 printf("Slice %d: w:%d h:%d x:%d y:%d\n",i,slices[i].width,slices[i].height,slices[i].x,slices[i].y);
             }
             results.resize(slices.size());
         }
+      
+        
 
         #pragma omp parallel for
         for(int s = 0; s < slices.size(); ++s){
+            float xs = 1.0;
+            float ys = 1.0;
             int tid = omp_get_thread_num();
             rknn_input inputs[rknn_app_ctx[tid].io_num.n_input];
             rknn_output outputs[rknn_app_ctx[tid].io_num.n_output];
@@ -288,7 +319,7 @@ int main(int argc, char** argv)
                 det_result->box.left += slices[s].x;
                 det_result->box.top += slices[s].y;
                 det_result->box.right += slices[s].x;
-                det_result->box.bottom += slices[s].y;
+                det_result->box.bottom += slices[s].y;    
             }
             results[s] = od_results;
             ret = rknn_outputs_release(rknn_app_ctx[tid].rknn_ctx, rknn_app_ctx[tid].io_num.n_output, outputs);
@@ -311,13 +342,13 @@ int main(int argc, char** argv)
             merged_slices.push_back(results.back().results[r]);
         }
         //combine merged slices with full picture results
+        orig_img = orig_img(cv::Rect(0,0,ori_c,ori_r)).clone();
         std::vector<object_detect_result> full_merge = greedy_nmm_postprocess(merged_slices, 0.2f, "IOU",true);
         for (auto &det_result : full_merge){
             float p = det_result.prop;
             float cls_id = det_result.cls_id;
-            
-            if (p > 0.5 && ((cls_id >= 0) && (cls_id <= 8))){
-            printf("M: %d %d %d %d %d %d %f\n", framecount,
+            if (p > 0.2 && ((cls_id >= 0) && (cls_id <= 8))){
+              printf("%d %d %d %d %d %d %f\n", framecount,
                                              det_result.box.left,
                                              det_result.box.top,
                                              det_result.box.right,
@@ -325,8 +356,9 @@ int main(int argc, char** argv)
                                              det_result.cls_id,
                                              det_result.prop);
             }
+            draw_box(&det_result,orig_img);    
         }
-
+        out.write(orig_img); 
         //show output
         if (framecount % 30 == 0) std::cout << "FPS" << f/16 << std::endl;
         Tend = std::chrono::steady_clock::now();
